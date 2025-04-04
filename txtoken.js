@@ -2,17 +2,19 @@ const { ethers } = require("ethers");
 require("dotenv").config();
 const fs = require("fs");
 
-// Ambil private key dari .env
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const TEA_RPC_URL = "https://tea-sepolia.g.alchemy.com/public";
+// Ambil konfigurasi dari .env
+const PRIVATE_KEYS = process.env.PRIVATE_KEYS ? process.env.PRIVATE_KEYS.split(",") : [];
+const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS; // Alamat kontrak token ERC-20
+const RPC_URL = process.env.RPC_URL || "https://rpc.sepolia.org"; // RPC URL jaringan
+const GAS_TOKEN = process.env.GAS_TOKEN || "ETH"; // Token untuk gas fee
 
-if (!PRIVATE_KEY) {
-    console.error("Harap isi PRIVATE_KEY di file .env");
+if (!PRIVATE_KEYS.length || !TOKEN_ADDRESS) {
+    console.error("Harap isi PRIVATE_KEYS dan TOKEN_ADDRESS di file .env");
     process.exit(1);
 }
 
-const provider = new ethers.JsonRpcProvider(TEA_RPC_URL);
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const wallets = PRIVATE_KEYS.map(privateKey => new ethers.Wallet(privateKey.trim(), provider));
 
 // Fungsi untuk membaca alamat dari file
 const readAddressesFromFile = (filePath) => {
@@ -25,78 +27,23 @@ const readAddressesFromFile = (filePath) => {
     }
 };
 
-// Fungsi untuk menghasilkan jumlah token acak antara 0.05 dan 0.2 TEA
-const getRandomAmount = () => {
-    const min = 0.0035; // Minimum 0.05 TEA
-    const max = 0.027;  // Maksimum 0.2 TEA
-    return ethers.parseEther((Math.random() * (max - min) + min).toFixed(5));
-};
-
-// Fungsi untuk menghasilkan jeda acak antara 60 dan 100 detik
-const getRandomDelay = () => {
-    const minDelay = 90 * 1000; // 60 detik dalam milidetik
-    const maxDelay = 145 * 1000; // 100 detik dalam milidetik
-    return Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
-};
-
-// Fungsi untuk mengecek dan menunggu jeda 24 jam jika sudah 200 transaksi
-let transactionCount = 0; // Counter global untuk melacak jumlah transaksi
-const checkTransactionLimit = async () => {
-    const MAX_TRANSACTIONS = 500; // Batas 200 transaksi (bisa diubah menjadi 150)
-    const DELAY_24H = 24 * 60 * 60 * 1000; // 24 jam dalam milidetik
-
-    if (transactionCount >= MAX_TRANSACTIONS) {
-        console.log(`Batas ${MAX_TRANSACTIONS} transaksi tercapai. Menunggu 24 jam sebelum melanjutkan...`);
-        await new Promise(resolve => setTimeout(resolve, DELAY_24H));
-        transactionCount = 0; // Reset counter setelah 24 jam
-    }
-};
-
-// Fungsi untuk mengirim TEA ke daftar alamat dari file dengan jeda
-const sendTeaFromFile = async (addresses) => {
-    for (let address of addresses) {
-        await checkTransactionLimit(); // Cek batas transaksi sebelum setiap transaksi
-
-        if (!ethers.isAddress(address)) {
-            console.error(`Alamat ${address} tidak valid. Melewati...`);
-            continue;
-        }
-
-        const amount = getRandomAmount();
-        const delay = getRandomDelay();
-
-        try {
-            const tx = await wallet.sendTransaction({
-                to: address,
-                value: amount,
-            });
-
-            const amountInEther = ethers.formatEther(amount);
-            console.log(`Mengirim ${amountInEther} TEA ke ${address}. Tx Hash: ${tx.hash}`);
-            await tx.wait();
-
-            transactionCount++; // Tambah counter transaksi
-            console.log(`Transaksi ke-${transactionCount} selesai. Menunggu ${delay/1000} detik untuk transaksi berikutnya...`);
-
-            // Tunggu jeda acak sebelum transaksi berikutnya
-            await new Promise(resolve => setTimeout(resolve, delay));
-        } catch (error) {
-            console.error(`Error saat mengirim ke ${address}:`, error);
-            // Tunggu jeda sebelum mencoba lagi
-            await new Promise(resolve => setTimeout(resolve, delay));
-            continue; // Lanjut ke alamat berikutnya
-        }
-    }
-
-    // Setelah semua alamat diproses, simpan log
-    if (transactionCount > 0) {
-        fs.writeFileSync("sent_addresses.txt", addresses.filter(addr => ethers.isAddress(addr)).join("\n"), "utf8");
-        console.log("Daftar alamat yang sudah dikirim token disimpan di 'sent_addresses.txt'");
+// Fungsi untuk mengirim token ERC-20
+const sendToken = async (fromWallet, toAddress, tokenContract, amount) => {
+    try {
+        const tx = await tokenContract.connect(fromWallet).transfer(toAddress, amount, {
+            gasLimit: 100000, // Batas gas, sesuaikan jika diperlukan
+            gasPrice: await provider.getFeeData().then(data => data.gasPrice), // Gas price dinamis
+        });
+        await tx.wait();
+        return tx;
+    } catch (error) {
+        console.error("Error saat mengirim token:", error);
+        throw error;
     }
 };
 
 (async () => {
-    const addressesFile = "addresses.txt"; // Nama file yang berisi daftar alamat
+    const addressesFile = "addresses.txt";
     const addresses = readAddressesFromFile(addressesFile);
 
     if (addresses.length === 0) {
@@ -104,7 +51,49 @@ const sendTeaFromFile = async (addresses) => {
         process.exit(1);
     }
 
-    console.log("Daftar alamat yang akan dikirim token:", addresses);
+    if (addresses.length > 1000) {
+        console.warn("Daftar alamat melebihi 1000. Hanya akan memproses 1000 alamat pertama.");
+        addresses.splice(1000); // Batasi ke 1000 alamat
+    }
 
-    await sendTeaFromFile(addresses);
+    // Inisialisasi kontrak token
+    const tokenContract = new ethers.Contract(
+        TOKEN_ADDRESS,
+        ["function transfer(address to, uint256 amount) public returns (bool)"],
+        provider
+    );
+
+    const amountToSend = ethers.parseUnits("10000", 18); // 10,000 token dengan 18 desimal
+
+    console.log(`Mengirim ${ethers.formatUnits(amountToSend, 18)} token ke setiap alamat...`);
+
+    for (let i = 0; i < addresses.length; i++) {
+        const toAddress = addresses[i];
+        const walletIndex = i % wallets.length; // Rotasi antara wallets
+
+        if (!ethers.isAddress(toAddress)) {
+            console.error(`Alamat ${toAddress} tidak valid. Melewati...`);
+            continue;
+        }
+
+        const wallet = wallets[walletIndex];
+
+        try {
+            console.log(`Mengirim ${ethers.formatUnits(amountToSend, 18)} token dari wallet ${walletIndex} ke ${toAddress}...`);
+            const tx = await sendToken(wallet, toAddress, tokenContract, amountToSend);
+            console.log(`Transaksi berhasil. Tx Hash: ${tx.hash}`);
+
+            // Jeda acak antara 10-30 detik
+            const delay = Math.floor(Math.random() * (30000 - 10000 + 1)) + 10000; // 10-30 detik
+            console.log(`Menunggu ${delay/1000} detik sebelum transaksi berikutnya...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        } catch (error) {
+            console.error(`Gagal mengirim ke ${toAddress} dari wallet ${walletIndex}:`, error);
+            // Coba lagi setelah jeda 60 detik
+            await new Promise(resolve => setTimeout(resolve, 60000)); // Jeda 60 detik sebelum retry
+            continue;
+        }
+    }
+
+    console.log("Semua transaksi selesai.");
 })();
